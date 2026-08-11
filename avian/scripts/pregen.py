@@ -268,6 +268,11 @@ def ebird_filter(species, region: str, key: str):
 
 
 # ---- Reference photo handling ----
+def contains_substring(text: str, substring: str) -> bool:
+    """Check if 'substring' exists anywhere in 'text', case-insensitive."""
+    if not isinstance(text, str) or not isinstance(substring, str):
+        raise ValueError("Both text and substring must be strings.")
+    return substring.lower() in text.lower()
 
 # Extensions to scan/write for cached reference photos. .jpg first matches
 # the JPEG majority of Wikipedia infoboxes and any legacy hand-placed
@@ -302,7 +307,7 @@ def fetch_wikipedia_thumb(sci: str, com: str) -> tuple[bytes, str] | None:
         # Prefer originalimage (higher res) over thumbnail.
         for k in ("originalimage", "thumbnail"):
             src = (meta.get(k) or {}).get("source")
-            if not src or not src.lower().endswith((".jpg", ".jpeg", ".png")):
+            if not src or not contains_substring( src, ".jpg" ) and not contains_substring( src, ".jpeg" ) and not contains_substring( src, ".png" ):
                 continue
             try:
                 req2 = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
