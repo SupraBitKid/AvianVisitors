@@ -119,6 +119,24 @@ EOF
   systemctl enable birdnet_analysis.service
 }
 
+prepare_caddy_webroot() {
+  echo "Preparing BirdNET-Pi webroot"
+  [[ "${BIRDNET_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+    && getent passwd "${BIRDNET_USER}" >/dev/null \
+    || { echo "Invalid BirdNET-Pi user" >&2; return 1; }
+  [[ "${EXTRACTED}" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    && [ "${EXTRACTED}" != / ] && [[ "${EXTRACTED}" != *'..'* ]] \
+    || { echo "Invalid BirdNET-Pi webroot" >&2; return 1; }
+  if ! sudo -u "${BIRDNET_USER}" mkdir -p -- "${EXTRACTED}"; then
+    echo "Could not create the BirdNET-Pi webroot" >&2
+    return 1
+  fi
+  [ -d "${EXTRACTED}" ] \
+    && sudo -u "${BIRDNET_USER}" test -w "${EXTRACTED}" \
+    && sudo -u "${BIRDNET_USER}" test -x "${EXTRACTED}" \
+    || { echo "BirdNET-Pi webroot is not writable" >&2; return 1; }
+}
+
 create_necessary_dirs() {
   echo "Creating necessary directories"
   [ -d ${EXTRACTED} ] || sudo -u ${USER} mkdir -p ${EXTRACTED}
@@ -417,6 +435,7 @@ install_services() {
   install_depends
   install_scripts
   install_avian_controls
+  prepare_caddy_webroot
   install_Caddyfile
   install_avahi_aliases
   install_birdnet_analysis

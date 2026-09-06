@@ -80,6 +80,11 @@ class LanAdminAuthStaticTests(unittest.TestCase):
         init = install.index("auth-state-init")
         caddy = install.index("install_Caddyfile")
         self.assertLess(init, caddy)
+        flow = install[install.index("install_services() {") :]
+        self.assertLess(
+            flow.index("prepare_caddy_webroot"),
+            flow.index("install_Caddyfile"),
+        )
         self.assertIn("auth-state-init", self.read("scripts/security_refresh.sh"))
 
     def test_caddy_uses_state_and_closes_required_surfaces(self):
