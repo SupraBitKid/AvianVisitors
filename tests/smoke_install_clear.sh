@@ -142,6 +142,8 @@ cat >"$repo/scripts/update_caddyfile.sh" <<'EOF'
 if [ -e /tmp/avian-release-flow/fail-caddy ]; then
   exit 1
 fi
+[ -d /home/bird/BirdSongs/Extracted ] \
+  || { echo "webroot missing before Caddy render" >&2; exit 1; }
 touch /tmp/avian-release-flow/caddy.called
 printf 'caddy\n' >>/tmp/avian-release-flow/service-order.log
 EOF
@@ -256,18 +258,59 @@ grep -q "Refusing to replace directory: $collision_root/fonts" "$test_root/colli
   || fail "directory collision did not report its target"
 
 # Clean overlay installation. Source the installer with no repository config
-# so only the two bounded functions below run.
+# so only the bounded functions below run.
+[ ! -e "$extracted" ] || fail "fresh-install webroot already exists"
 (
-  my_dir=$repo
   USER=bird
   HOME=$bird_home
-  RECS_DIR=$recordings
-  EXTRACTED=$extracted
-  PROCESSED=$processed
+  export BIRDNET_USER=bird
+  export RECS_DIR=$recordings
+  export EXTRACTED=$extracted
+  export PROCESSED=$processed
   source "$repo/scripts/install_services.sh"
   install_avian_controls
+  prepare_caddy_webroot
+  [ "$(stat -c '%U:%G' "$EXTRACTED")" = bird:bird ] \
+    || fail "fresh-install webroot has the wrong owner"
+  install_Caddyfile
+  prepare_caddy_webroot
   create_necessary_dirs
 )
+
+[ -e "$test_root/caddy.called" ] \
+  || fail "Caddy was not rendered after webroot preparation"
+: >"$test_root/systemctl.log"
+chown bird:bird "$test_root/systemctl.log"
+
+unsafe_webroot=$test_root/unsafe-webroot
+printf 'not a directory\n' >"$unsafe_webroot"
+chown bird:bird "$unsafe_webroot"
+(
+  USER=bird
+  HOME=$bird_home
+  export BIRDNET_USER=bird
+  export EXTRACTED=$unsafe_webroot
+  source "$repo/scripts/install_services.sh"
+  if prepare_caddy_webroot >"$test_root/unsafe-webroot.log" 2>&1; then
+    fail "fresh-install preparation accepted a file as the webroot"
+  fi
+)
+grep -Fq "Could not create the BirdNET-Pi webroot" \
+  "$test_root/unsafe-webroot.log" \
+  || fail "unsafe fresh-install webroot returned the wrong error"
+
+(
+  USER=bird
+  HOME=$bird_home
+  export BIRDNET_USER=bird
+  export EXTRACTED=/
+  source "$repo/scripts/install_services.sh"
+  if prepare_caddy_webroot >"$test_root/root-webroot.log" 2>&1; then
+    fail "fresh-install preparation accepted the filesystem root"
+  fi
+)
+grep -Fq "Invalid BirdNET-Pi webroot" "$test_root/root-webroot.log" \
+  || fail "invalid fresh-install webroot returned the wrong error"
 
 assert_avian_runtime_links
 assert_stock_runtime_links
