@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# This installs the services that have been selected
-set -x # Uncomment to enable debugging
-trap 'rm -f ${tmpfile}' EXIT
+# This installs the services that have been selected.
+# It is the full first-install path. Updates use reinstall_services.sh.
+set -e
+trap 'rm -f "${tmpfile-}"' EXIT
 trap 'exit 1' SIGINT SIGHUP
 tmpfile=$(mktemp)
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+my_dir=$(cd -- "$script_dir/.." && pwd -P)
 config_file=$my_dir/birdnet.conf
 export USER=$USER
 export HOME=$HOME
@@ -20,7 +23,7 @@ install_depends() {
   apt install --no-install-recommends -qqy caddy sqlite3 php-sqlite3 php-fpm php-curl php-xml php-zip php-mbstring php icecast2 \
     pulseaudio avahi-utils sox libsox-fmt-mp3 alsa-utils ffmpeg \
     wget curl unzip bc \
-    python3-pip python3-venv lsof net-tools inotify-tools
+    python3-pip python3-venv python3-pil lsof net-tools inotify-tools
 }
 
 set_hostname() {
@@ -38,6 +41,184 @@ install_scripts() {
   ln -sf ${my_dir}/scripts/* /usr/local/bin/
 }
 
+ensure_bundle_sandbox_user() {
+  local row uid gid home shell groups group_row group_gid group_members
+  if ! getent passwd avian-bundle >/dev/null; then
+    useradd --system --user-group --home-dir /nonexistent \
+      --shell /usr/sbin/nologin avian-bundle
+  fi
+  row=$(getent passwd avian-bundle) || return 1
+  IFS=: read -r _ _ uid gid _ home shell <<<"$row"
+  group_row=$(getent group avian-bundle) || return 1
+  IFS=: read -r _ _ group_gid group_members <<<"$group_row"
+  groups=$(id -G avian-bundle)
+  [ "$uid" != 0 ] && [ "$gid" != 0 ] \
+    && [ "$home" = /nonexistent ] \
+    && [ "$shell" = /usr/sbin/nologin ] \
+    && [ "$group_gid" = "$gid" ] && [ -z "$group_members" ] \
+    && [ "$groups" = "$gid" ] \
+    || { echo "Unsafe bundle image sandbox account" >&2; return 1; }
+}
+
+ensure_bundle_sandbox_root() {
+  local path mode
+  for path in /var/empty /var/empty/avian-bundle; do
+    mode=0755
+    [ "$path" != /var/empty/avian-bundle ] || mode=0555
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ -d "$path" ] && [ ! -L "$path" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "$path")" = "0:0:${mode#0}" ] \
+        || { echo "Unsafe bundle image sandbox root" >&2; return 1; }
+    else
+      install -d -o root -g root -m "$mode" "$path"
+    fi
+  done
+}
+
+install_avian_controls() {
+  local source target admin_init_output bundle_init_output bundle_cli_temp caddy_gid educator_lock
+  local auth_state_dir auth_lock bundle_marker station_gid bundle_export_lock
+  local coordination_lock lock_policy lock_policy_temp tmpfiles_dir
+  while read -r source target; do
+    [ -f "${my_dir}/scripts/${source}" ] || continue
+    install -o root -g root -m 0755 \
+      "${my_dir}/scripts/${source}" "/usr/local/sbin/${target}"
+  done <<'EOF'
+admin_control.sh avian-admin-control
+archive_control.sh avian-archive-control
+maintenance_control.sh avian-maintenance-control
+update_birdnet.sh avian-update-control
+reinstall_services.sh avian-service-refresh
+security_refresh.sh avian-security-refresh
+generation_runtime_control.sh avian-generation-runtime
+link_webroot.sh avian-link-webroot
+update_caddyfile.sh avian-caddy-refresh
+educators_control.sh avian-educators
+EOF
+
+  station_gid=$(id -g "$USER") \
+    || { echo "BirdNET-Pi group was not found" >&2; return 1; }
+  bundle_export_lock=/run/lock/avian-bundle-export.lock
+  tmpfiles_dir=/etc/tmpfiles.d
+  lock_policy=$tmpfiles_dir/avian-bundle-locks.conf
+  if [ ! -e "$tmpfiles_dir" ] && [ ! -L "$tmpfiles_dir" ]; then
+    install -d -o root -g root -m 0755 "$tmpfiles_dir"
+  fi
+  [ -d "$tmpfiles_dir" ] && [ ! -L "$tmpfiles_dir" ] \
+    && [ "$(stat -c '%u:%g:%a' -- "$tmpfiles_dir")" = '0:0:755' ] \
+    || { echo "Unsafe tmpfiles directory" >&2; return 1; }
+  for coordination_lock in \
+    /run/lock/avian-generation.lock "$bundle_export_lock"; do
+    if [ -e "$coordination_lock" ] || [ -L "$coordination_lock" ]; then
+      [ -f "$coordination_lock" ] && [ ! -L "$coordination_lock" ] \
+        && [ "$(stat -c '%u:%h' -- "$coordination_lock")" = '0:1' ] \
+        || { echo "Unsafe Avian Visitors coordination lock" >&2; return 1; }
+      # Explicit account migration may update a verified live inode; boot may not.
+      chgrp "$station_gid" "$coordination_lock"
+      chmod 0660 "$coordination_lock"
+    fi
+  done
+  if [ -e "$lock_policy" ] || [ -L "$lock_policy" ]; then
+    [ -f "$lock_policy" ] && [ ! -L "$lock_policy" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' -- "$lock_policy")" = '0:0:644:1' ] \
+      || { echo "Unsafe Avian Visitors tmpfiles policy" >&2; return 1; }
+  fi
+  lock_policy_temp=$(mktemp "$tmpfiles_dir/.avian-bundle-locks.XXXXXX")
+  printf 'f /run/lock/avian-generation.lock :0660 :root :%s -\n' "$station_gid" >"$lock_policy_temp"
+  printf 'f /run/lock/avian-bundle-export.lock :0660 :root :%s -\n' "$station_gid" >>"$lock_policy_temp"
+  chown root:root "$lock_policy_temp"
+  chmod 0644 "$lock_policy_temp"
+  mv -fT -- "$lock_policy_temp" "$lock_policy"
+  /usr/bin/systemd-tmpfiles --create "$lock_policy"
+  [ "$(stat -c '%u:%g:%a:%h' -- /run/lock/avian-generation.lock)" = \
+    "0:$station_gid:660:1" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' -- "$bundle_export_lock")" = \
+      "0:$station_gid:660:1" ] \
+    || { echo "Avian Visitors coordination lock policy failed" >&2; return 1; }
+
+  auth_state_dir=/var/lib/avian-visitors
+  auth_lock=$auth_state_dir/admin-auth.lock
+  if [ -e "$auth_state_dir" ] || [ -L "$auth_state_dir" ]; then
+    [ -d "$auth_state_dir" ] && [ ! -L "$auth_state_dir" ] \
+      && [ "$(stat -c '%u:%g:%a' -- "$auth_state_dir")" = '0:0:755' ] \
+      || { echo "Unsafe admin state directory" >&2; return 1; }
+  else
+    install -d -o root -g root -m 0755 "$auth_state_dir"
+  fi
+
+  [ -f "${my_dir}/avian/scripts/bundle_manager.py" ] \
+    && [ -f "${my_dir}/avian/scripts/bundle_species.py" ] \
+    && [ -f "${my_dir}/avian/bundles/catalog-v1.json" ] \
+    || { echo "Bundle manager release files are missing" >&2; return 1; }
+  install -o root -g root -m 0755 \
+    "${my_dir}/avian/scripts/bundle_manager.py" /usr/local/sbin/avian-bundle-control
+  [ -f "${my_dir}/scripts/avian-bundle" ] \
+    || { echo "Bundle command release file is missing" >&2; return 1; }
+  bundle_cli_temp=$(mktemp /usr/local/bin/.avian-bundle.XXXXXX)
+  install -o root -g root -m 0755 \
+    "${my_dir}/scripts/avian-bundle" "$bundle_cli_temp"
+  mv -f "$bundle_cli_temp" /usr/local/bin/avian-bundle
+  install -d -o root -g root -m 0755 /usr/share/avian-visitors/bundles
+  install -o root -g root -m 0644 \
+    "${my_dir}/avian/bundles/catalog-v1.json" \
+    /usr/share/avian-visitors/bundles/catalog-v1.json
+  install -o root -g root -m 0644 \
+    "${my_dir}/avian/scripts/bundle_species.py" \
+    /usr/share/avian-visitors/bundles/bundle_species.py
+  env -i LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/local/sbin/avian-bundle-control configure-station \
+    --user "$USER" --root "$my_dir" --json
+  ensure_bundle_sandbox_user
+  ensure_bundle_sandbox_root
+  if ! bundle_init_output=$(env -i HOME=/root LC_ALL=C \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/local/sbin/avian-bundle-control initialize --json); then
+    printf '%s\n' "$bundle_init_output" >&2
+    return 1
+  fi
+  bundle_marker=$auth_state_dir/bundles-v1.enabled
+  if [ -e "$bundle_marker" ] || [ -L "$bundle_marker" ]; then
+    [ -f "$bundle_marker" ] && [ ! -L "$bundle_marker" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' -- "$bundle_marker")" = '0:0:644:1' ] \
+      || { echo "Unsafe bundle provisioning marker" >&2; return 1; }
+  else
+    install -o root -g root -m 0644 /dev/null "$bundle_marker"
+  fi
+
+  if [ -e "$auth_lock" ] || [ -L "$auth_lock" ]; then
+    [ -f "$auth_lock" ] && [ ! -L "$auth_lock" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' -- "$auth_lock")" = '0:0:600:1' ] \
+      || { echo "Unsafe admin state lock" >&2; return 1; }
+  else
+    install -o root -g root -m 0600 /dev/null "$auth_lock"
+  fi
+  caddy_gid=$(getent group caddy | awk -F: 'NR == 1 { print $3 }')
+  [ -n "$caddy_gid" ] \
+    || { echo "Caddy group was not found" >&2; return 1; }
+  educator_lock=$auth_state_dir/educators.lock
+  if [ ! -e "$educator_lock" ] && [ ! -L "$educator_lock" ]; then
+    install -o root -g caddy -m 0660 /dev/null "$educator_lock"
+  fi
+  [ -f "$educator_lock" ] && [ ! -L "$educator_lock" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' -- "$educator_lock")" = \
+      "0:$caddy_gid:660:1" ] \
+    || { echo "Unsafe Educators coordination lock" >&2; return 1; }
+  # Initialize the verifier and atomically provision the derived rate state
+  # before the first managed Caddy render. Runtime readers fail closed while
+  # either state is absent, so a clean install must not defer this step.
+  if ! admin_init_output=$(/usr/local/sbin/avian-admin-control auth-state-init); then
+    printf '%s\n' "$admin_init_output" >&2
+    return 1
+  fi
+
+  # Refresh an archive the owner has already opted into. First-time setup
+  # remains a deliberate Settings action.
+  if [ -x /usr/local/sbin/avian-archive-control ] \
+    && [ -x "${HOME}/bird-archive/archive_to_drive.sh" ]; then
+    /usr/local/sbin/avian-archive-control install >/dev/null
+  fi
+}
+
 install_birdnet_analysis() {
   cat << EOF > $HOME/BirdNET-Pi/templates/birdnet_analysis.service
 [Unit]
@@ -53,6 +234,24 @@ WantedBy=multi-user.target
 EOF
   ln -sf $HOME/BirdNET-Pi/templates/birdnet_analysis.service /usr/lib/systemd/system
   systemctl enable birdnet_analysis.service
+}
+
+prepare_caddy_webroot() {
+  echo "Preparing BirdNET-Pi webroot"
+  [[ "${BIRDNET_USER}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+    && getent passwd "${BIRDNET_USER}" >/dev/null \
+    || { echo "Invalid BirdNET-Pi user" >&2; return 1; }
+  [[ "${EXTRACTED}" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    && [ "${EXTRACTED}" != / ] && [[ "${EXTRACTED}" != *'..'* ]] \
+    || { echo "Invalid BirdNET-Pi webroot" >&2; return 1; }
+  if ! sudo -u "${BIRDNET_USER}" mkdir -p -- "${EXTRACTED}"; then
+    echo "Could not create the BirdNET-Pi webroot" >&2
+    return 1
+  fi
+  [ -d "${EXTRACTED}" ] \
+    && sudo -u "${BIRDNET_USER}" test -w "${EXTRACTED}" \
+    && sudo -u "${BIRDNET_USER}" test -x "${EXTRACTED}" \
+    || { echo "BirdNET-Pi webroot is not writable" >&2; return 1; }
 }
 
 create_necessary_dirs() {
@@ -77,21 +276,20 @@ create_necessary_dirs() {
   sudo -u ${USER} ln -fs $my_dir/scripts/stats.php ${EXTRACTED}
   sudo -u ${USER} ln -fs $my_dir/scripts/todays_detections.php ${EXTRACTED}
   sudo -u ${USER} ln -fs $my_dir/scripts/history.php ${EXTRACTED}
-  sudo -u ${USER} ln -fs $my_dir/weekly_report.php ${EXTRACTED}
-  if ! source "$my_dir/scripts/link_webroot.sh"; then
-    echo "Could not load the AvianVisitors webroot helper" >&2
-    exit 1
+  sudo -u ${USER} ln -fs $my_dir/scripts/weekly_report.php ${EXTRACTED}
+  if [ ! -x /usr/local/sbin/avian-link-webroot ]; then
+    echo "AvianVisitors webroot helper is not installed" >&2
+    return 1
   fi
-  if ! link_avian_visitors_webroot "$my_dir" "${EXTRACTED}" "${USER}"; then
+  if ! /usr/local/sbin/avian-link-webroot "${my_dir}" "${EXTRACTED}" "${USER}"; then
     echo "Could not create the AvianVisitors webroot links" >&2
-    exit 1
+    return 1
   fi
   sudo -u ${USER} ln -fs ${HOME}/phpsysinfo ${EXTRACTED}
   sudo -u ${USER} ln -fs $my_dir/templates/phpsysinfo.ini ${HOME}/phpsysinfo/
   sudo -u ${USER} ln -fs $my_dir/templates/green_bootstrap.css ${HOME}/phpsysinfo/templates/
   sudo -u ${USER} ln -fs $my_dir/templates/index_bootstrap.html ${HOME}/phpsysinfo/templates/html
   sudo -u ${USER} ln -sf $my_dir/model/labels_nm/labels_en.txt $my_dir/model/labels_flickr.txt
-  chmod -R g+rw $my_dir
   chmod -R g+rw ${RECS_DIR}
 }
 
@@ -157,78 +355,11 @@ EOF
 }
 
 install_Caddyfile() {
-  [ -d /etc/caddy ] || mkdir /etc/caddy
-  if [ -f /etc/caddy/Caddyfile ];then
-    cp /etc/caddy/Caddyfile{,.original}
-  fi
-  if ! [ -z ${CADDY_PWD} ];then
-  HASHWORD=$(caddy hash-password --plaintext ${CADDY_PWD})
-  cat << EOF > /etc/caddy/Caddyfile
-http:// ${BIRDNETPI_URL} {
-  root * ${EXTRACTED}
-  file_server browse
-  handle /By_Date/* {
-    file_server browse
-  }
-  handle /Charts/* {
-    file_server browse
-  }
-  basicauth /views.php?view=File* {
-    birdnet ${HASHWORD}
-  }
-  basicauth /Processed* {
-    birdnet ${HASHWORD}
-  }
-  basicauth /scripts* {
-    birdnet ${HASHWORD}
-  }
-  basicauth /stream {
-    birdnet ${HASHWORD}
-  }
-  basicauth /phpsysinfo* {
-    birdnet ${HASHWORD}
-  }
-  basicauth /terminal* {
-    birdnet ${HASHWORD}
-  }
-  reverse_proxy /stream localhost:8000
-  php_fastcgi unix//run/php/php-fpm.sock
-  reverse_proxy /log* localhost:8080
-  reverse_proxy /stats* localhost:8501
-  reverse_proxy /terminal* localhost:8888
-}
-EOF
-  else
-    cat << EOF > /etc/caddy/Caddyfile
-http:// ${BIRDNETPI_URL} {
-  root * ${EXTRACTED}
-  file_server browse
-  handle /By_Date/* {
-    file_server browse
-  }
-  handle /Charts/* {
-    file_server browse
-  }
-  reverse_proxy /stream localhost:8000
-  php_fastcgi unix//run/php/php-fpm.sock
-  reverse_proxy /log* localhost:8080
-  reverse_proxy /stats* localhost:8501
-  reverse_proxy /terminal* localhost:8888
-}
-EOF
-  fi
-
   systemctl enable caddy
-  usermod -aG $USER caddy
+  usermod -aG "$USER" caddy
   usermod -aG video caddy
-  chmod g+r+x $HOME
-
-  # Serve the AvianVisitors collage at / rather than the stock BirdNET-Pi UI.
-  # The Caddyfile written above is the stock one (hardcoded php-fpm.sock, no
-  # index.html try_files override); re-apply both through update_caddyfile.sh,
-  # the single source of truth, so / serves index.html not index.php. Run it
-  # last so it wins.
-  "$HOME/BirdNET-Pi/scripts/update_caddyfile.sh"
+  chmod g+rx "$HOME"
+  "${my_dir}/scripts/update_caddyfile.sh"
 }
 
 install_avahi_aliases() {
@@ -346,45 +477,14 @@ configure_caddy_php() {
   echo "Configuring PHP for Caddy"
   sed -i 's/www-data/caddy/g' /etc/php/*/fpm/pool.d/www.conf
   systemctl restart php\*-fpm.service
-  echo "Adding Caddy sudoers rule"
-  cat << EOF > /etc/sudoers.d/010_caddy-nopasswd
-caddy ALL=(ALL) NOPASSWD: ALL
-EOF
-  chmod 0440 /etc/sudoers.d/010_caddy-nopasswd
-  # AvianVisitors admin overlay needs to restart whitelisted units and
-  # tail their journal. The 010 rule above already covers everything via
-  # NOPASSWD: ALL - this 020 rule pins the exact commands we depend on
-  # so the admin overlay stays working even if a future upstream change
-  # tightens 010. See SECURITY.md for the longer story.
-  if [ -d $my_dir/avian ]; then
-    echo "Adding AvianVisitors admin allowlist"
-    cat << EOF > /etc/sudoers.d/020_avian-admin
-caddy ALL=(root) NOPASSWD: \\
-    /bin/systemctl restart birdnet_recording, \\
-    /bin/systemctl restart birdnet_analysis, \\
-    /bin/systemctl restart birdnet_log, \\
-    /bin/systemctl restart birdnet_stats, \\
-    /bin/systemctl restart spectrogram_viewer, \\
-    /bin/systemctl restart livestream, \\
-    /bin/systemctl restart icecast2, \\
-    /bin/systemctl restart caddy, \\
-    /bin/journalctl -u birdnet_recording *, \\
-    /bin/journalctl -u birdnet_analysis *, \\
-    /bin/journalctl -u birdnet_log *, \\
-    /bin/journalctl -u birdnet_stats *, \\
-    /bin/journalctl -u spectrogram_viewer *, \\
-    /bin/journalctl -u livestream *, \\
-    /bin/journalctl -u icecast2 *, \\
-    /bin/journalctl -u caddy *
-EOF
-    chmod 0440 /etc/sudoers.d/020_avian-admin
-    visudo -c -f /etc/sudoers.d/020_avian-admin >/dev/null
-  fi
 }
 
 install_phpsysinfo() {
-  sudo -u ${USER} git clone https://github.com/phpsysinfo/phpsysinfo.git \
-    ${HOME}/phpsysinfo
+  if [ -d "${HOME}/phpsysinfo/.git" ]; then
+    return 0
+  fi
+  sudo -u "${USER}" git clone https://github.com/phpsysinfo/phpsysinfo.git \
+    "${HOME}/phpsysinfo"
 }
 
 config_icecast() {
@@ -412,6 +512,7 @@ Restart=always
 Type=simple
 RestartSec=3
 User=${USER}
+ExecCondition=/usr/local/bin/livestream.sh --check
 ExecStart=/usr/local/bin/livestream.sh
 [Install]
 WantedBy=multi-user.target
@@ -420,16 +521,39 @@ EOF
   systemctl enable livestream.service
 }
 
+install_cron_template() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    # Keep operator schedules, while treating reboot cleanup as a separate job.
+    if ! awk -v wanted="$line" '
+      function identity(line, fields, user_field) {
+        sub(/^[[:space:]]*#[[:space:]]*/, "", line)
+        split(line, fields)
+        user_field = fields[1] ~ /^@/ ? 2 : 6
+        return (fields[1] == "@reboot") SUBSEP fields[user_field] SUBSEP fields[user_field + 1]
+      }
+      /^#birdnet$/ { marked=1; next }
+      marked && identity($0) == identity(wanted) { found=1 }
+      { marked=0 }
+      END { exit !found }
+    ' /etc/crontab; then
+      # uninstall.sh removes each marker together with the following job.
+      printf '#birdnet\n%s\n' "$line" >> /etc/crontab
+    fi
+  done < <(sed "s/\$USER/$USER/g" "$1")
+}
+
 install_cleanup_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/cleanup.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/cleanup.cron"
 }
 
 install_weekly_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/weekly_report.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/weekly_report.cron"
 }
 
 install_automatic_update_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/automatic_update.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/automatic_update.cron"
 }
 
 chown_things() {
@@ -437,8 +561,8 @@ chown_things() {
 }
 
 increase_caddy_timeout() {
-  mkdir /etc/systemd/system/caddy.service.d
-  cat << EOF > /etc/systemd/system/caddy.service.d/override.conf
+  mkdir -p /etc/systemd/system/caddy.service.d
+  cat << EOF > /etc/systemd/system/caddy.service.d/10-avian-timeout.conf
 [Service]
 TimeoutSec=300s
 EOF
@@ -446,6 +570,7 @@ EOF
 }
 
 install_services() {
+  prepare_caddy_webroot
   set_hostname
   update_etc_hosts
   set_login
@@ -453,7 +578,7 @@ install_services() {
 
   install_depends
   install_scripts
-  install_Caddyfile
+  install_avian_controls
   install_avahi_aliases
   install_birdnet_analysis
   install_birdnet_stats_service
@@ -477,11 +602,19 @@ install_services() {
   USER=$USER HOME=$HOME ${my_dir}/scripts/createdb.sh
 }
 
-if [ -f ${config_file} ];then
-  source ${config_file}
-  source install_helpers.sh
+if [ -f "${config_file}" ];then
+  # shellcheck source=/dev/null
+  source "${config_file}"
+  source "${my_dir}/scripts/install_helpers.sh"
   install_services
   chown_things
+  /usr/local/sbin/avian-security-refresh
+  install_Caddyfile
+  case "${AVIAN_INSTALL_EDUCATORS:-0}" in
+    0) ;;
+    1) /usr/local/sbin/avian-educators enable ;;
+    *) echo "Invalid Educators install selection" >&2; exit 1 ;;
+  esac
 else
   echo "Unable to find a configuration file. Please make sure that $config_file exists."
 fi

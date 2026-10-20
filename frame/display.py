@@ -41,8 +41,9 @@ SPECTRA6 = [(236, 234, 223), (26, 26, 28), (165, 60, 56),
 
 DEFAULTS = {
     "base_url": "http://birdnet.local",
-    "species_source": "",   # "" = the recent API at base_url; "birdweather" = BirdWeather near a ZIP
-    "zip": "",              # BirdWeather ZIP / postal code (with species_source = "birdweather")
+    "species_source": "",   # "" = the recent API; "birdweather" = one station or a ZIP
+    "zip": "",              # BirdWeather ZIP / postal code (use one locator only)
+    "bw_station_id": "",    # public BirdWeather station ID (use instead of zip)
     "bw_days": 7,           # BirdWeather lookback window, in days
     "bw_country": "us",     # geocoder country for the ZIP
     "hours": 24,
@@ -52,8 +53,9 @@ DEFAULTS = {
     "shoot_title": None, "shoot_subtitle": None,
     "shoot_headline_px": 42, "shoot_eyebrow_px": 18, "shoot_lowercase": False,
     "shoot_mat": 0.04, "shoot_small_floor": 0.04, "shoot_count_exp": 0.65,
+    "bird_names": False,
     "mat": 0.0,             # extra global shrink of the content inside the A5 opening
-    "opening": 0.7071,      # fraction of panel height the opening covers; 0.7071 = A5 matboard (default). Raise toward ~0.96 to fill a bare panel with no matboard.
+    "opening": 0.7071,      # opening height as a panel fraction; 0.7071 preserves A5
     "rotate": 90,           # 90 or 270 if the frame hangs the other way up
     "saturation": 0.6,
     "panel": "",            # "el133uf1" forces the 13.3" driver if auto() fails
@@ -61,6 +63,7 @@ DEFAULTS = {
     "heal_hours": 24,
     "state": "~/.birdframe/state.json",
     "cache": "~/.birdframe",
+    "bundle_root": "~/.birdframe/bundles",
     "timeout": 180,      # seconds; a Zero 2 W needs ~70-120s to shoot the collage
     "basic_user": None, "basic_pass": None,
 }
@@ -91,21 +94,59 @@ def fetch_recent(base, hours, timeout, auth=None):
     if auth:
         req.add_header("Authorization", auth)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read(2_000_000)).get("species", [])
+        data = json.loads(r.read(2_000_000))
+    if not isinstance(data, dict) or not isinstance(data.get("species"), list):
+        raise ValueError("recent API has no species list")
+    return data["species"]
 
 
-def signature(species):
+def signature(species, scope=""):
     items = sorted((slugify(s["sci"]), _bucket(int(s.get("n") or 1))) for s in species)
-    return hashlib.sha256(json.dumps(items).encode()).hexdigest()[:16]
+    material = [scope, items] if scope else items
+    return hashlib.sha256(json.dumps(material).encode()).hexdigest()[:16]
 
 
-def fetch_species(cfg, auth=None):
+def birdweather_locator(cfg):
+    """Return (kind, value) for the one configured BirdWeather source."""
+    station = cfg.get("bw_station_id")
+    has_station = station not in (None, "", 0)
+    zip_code = cfg.get("zip")
+    has_zip = isinstance(zip_code, str) and bool(zip_code.strip())
+    if has_station and has_zip:
+        raise ValueError("BirdWeather config must use either bw_station_id or zip, not both")
+    if has_station:
+        import birdweather
+        return "station", birdweather.station_id(station)
+    if has_zip:
+        return "zip", zip_code.strip()
+    raise ValueError("BirdWeather config needs bw_station_id or zip")
+
+
+def birdweather_signature_scope(cfg):
+    kind, value = birdweather_locator(cfg)
+    if kind == "station":
+        return f"birdweather:station:{value}:days:{cfg['bw_days']}"
+    return f"birdweather:zip:{cfg['bw_country']}:{value}:days:{cfg['bw_days']}"
+
+
+def fetch_species(cfg, auth=None, drawable=None):
     """The species list the signature is built from: the BirdNET-Pi recent API
-    by default, or BirdWeather's recent detections near a ZIP when
+    by default, or BirdWeather detections from one station or near a ZIP when
     species_source = "birdweather"."""
     if cfg.get("species_source") == "birdweather":
         import birdweather
-        return birdweather.species_for_zip(cfg["zip"], country=cfg["bw_country"], days=cfg["bw_days"])
+        kind, value = birdweather_locator(cfg)
+        inventory = {} if drawable is None else {"drawable": drawable}
+        if kind == "station":
+            return birdweather.species_for_station(
+                value, days=cfg["bw_days"], **inventory
+            )
+        return birdweather.species_for_zip(
+            value,
+            country=cfg["bw_country"],
+            days=cfg["bw_days"],
+            **inventory,
+        )
     return fetch_recent(cfg["base_url"], cfg["hours"], cfg["timeout"], auth)
 
 
@@ -133,10 +174,8 @@ def _paper(img):
     return tuple(int(statistics.median(c)) for c in zip(*px))
 
 
-# The opening is a 1:sqrt(2) rectangle centred in the panel; the content
-# floats inside it with `mat` of inner whitespace. `opening` sets how much
-# of the panel that rectangle covers -- 0.7071 reproduces an A5 matboard
-# opening (default), raise it toward ~0.96 to fill a bare panel.
+# The opening is a 1:sqrt(2) rectangle centred in the panel. `opening` sets
+# how much of the panel height it covers; 0.7071 preserves the A5 default.
 def opening_size(opening):
     if isinstance(opening, bool):
         raise ValueError("opening must be greater than 0 and at most 1")
@@ -147,8 +186,7 @@ def opening_size(opening):
     if not 0 < opening <= 1:
         raise ValueError("opening must be greater than 0 and at most 1")
     h = PANEL_H * opening
-    w = h / 1.41421
-    return w, h
+    return h / 1.41421, h
 
 
 def _place(content, paper, mat, opening):
@@ -259,7 +297,7 @@ def quantize_spectra6(img):
 
 
 def _draw_mat_box(img, opening):
-    """Dev aid: outline the mat opening so the matte and centring show."""
+    """Dev aid: outline the configured mat opening."""
     ow, oh = opening_size(opening)
     x0, y0 = round((PANEL_W - ow) / 2), round((PANEL_H - oh) / 2)
     ImageDraw.Draw(img).rectangle((x0, y0, PANEL_W - x0 - 1, PANEL_H - y0 - 1),
@@ -314,16 +352,41 @@ def in_quiet_hours(cfg, hour):
     return s <= hour < e if s < e else hour >= s or hour < e
 
 
+def frame_url(url, bird_names):
+    """Set the frame's label preference without disturbing other URL state."""
+    import urllib.parse
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+             if k != "labels"]
+    query.append(("labels", "1" if bird_names else "0"))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
 # --- run --------------------------------------------------------------------
-def obtain_image(cfg, species=None):
+def obtain_image(cfg, species=None, bundle=None, *, capture=None):
+    bundle_options = (
+        {}
+        if bundle is None
+        else {
+            "cutout_resolver": bundle.resolve,
+            "dims_path": bundle.dims_path,
+            "masks_path": bundle.masks_path,
+            "bundle_assets": bundle.assets_response,
+        }
+    )
     if cfg.get("species_source") == "birdweather":
         from shoot import shoot_birdweather
         if species is None:  # gate skipped (--no-signature): fetch the list to render
-            species = fetch_species(cfg, _auth(cfg))
+            species = fetch_species(
+                cfg,
+                _auth(cfg),
+                drawable=None if bundle is None else bundle.drawable_slugs,
+            )
         out = os.path.join(os.path.expanduser(cfg["cache"]), "frame.png")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         shoot_birdweather(out, species, title=cfg["shoot_title"], subtitle=cfg["shoot_subtitle"],
-                          timeout_ms=cfg["timeout"] * 1000)
+                          timeout_ms=cfg["timeout"] * 1000, bird_names=cfg["bird_names"],
+                          capture=capture, **bundle_options)
         return Image.open(out).convert("RGB")
     if cfg["shoot"]:
         from shoot import shoot
@@ -333,11 +396,22 @@ def obtain_image(cfg, species=None):
               headline_px=cfg["shoot_headline_px"], eyebrow_px=cfg["shoot_eyebrow_px"],
               lowercase=cfg["shoot_lowercase"], mat=cfg["shoot_mat"],
               small_floor=cfg["shoot_small_floor"], count_exp=cfg["shoot_count_exp"], timeout_ms=cfg["timeout"] * 1000,
-              user=cfg["basic_user"], password=cfg["basic_pass"])
+              user=cfg["basic_user"], password=cfg["basic_pass"], window_hours=cfg["hours"],
+              bird_names=cfg["bird_names"], capture=capture, **bundle_options)
         return Image.open(out).convert("RGB")
+    if bundle is not None:
+        raise ValueError(
+            "an active illustration bundle requires local or BirdWeather render mode"
+        )
     src = cfg["image_url"] or cfg["image"]
     if not src:
         raise ValueError("set image, image_url, or shoot in config")
+    # A pre-rendered frame is still someone's render, so ask it for names the
+    # same way this Pi asks its own browser. A source that does not know the
+    # parameter ignores it and sends what it always sent, so this is safe
+    # against anything. URLs only: a local file path has no query string.
+    if cfg["image_url"]:
+        src = frame_url(src, cfg["bird_names"])
     return get_image(src, cfg["timeout"], _auth(cfg))
 
 
@@ -346,10 +420,25 @@ def run(cfg, preview=None, force=False, use_signature=True, mat_box=False):
     state = load_state(cfg["state"])
     sig = None
     species = None
+    try:
+        from bundle_runtime import active_bundle
+        bundle = active_bundle(cfg.get("bundle_root"))
+    except Exception as error:
+        print(f"active bundle validation failed: {error}", file=sys.stderr)
+        return False
     if use_signature:
         try:
-            species = fetch_species(cfg, _auth(cfg))
-            sig = signature(species)
+            species = fetch_species(
+                cfg,
+                _auth(cfg),
+                drawable=None if bundle is None else bundle.drawable_slugs,
+            )
+            scope = birdweather_signature_scope(cfg) if cfg.get("species_source") == "birdweather" else ""
+            sig = signature(species, scope)
+            if bundle is not None:
+                sig = hashlib.sha256(
+                    (sig + ":" + bundle.reference.get("selection_revision", bundle.reference["revision"])).encode()
+                ).hexdigest()[:16]
         except Exception as e:
             print(f"signature fetch failed: {e}", file=sys.stderr)  # treat as no change
     heal_due = now - state.get("last_refresh", 0) >= cfg["heal_hours"] * 3600
@@ -357,17 +446,25 @@ def run(cfg, preview=None, force=False, use_signature=True, mat_box=False):
     if not force and not preview:
         if in_quiet_hours(cfg, datetime.now().hour):
             print("quiet hours; skip")
-            return
+            return True
         if not changed and not heal_due:
             print("no change; skip")
-            return
+            return True
         print("refresh:", "changed" if changed else "heal")
 
     try:
-        img = fit_panel(obtain_image(cfg, species))
+        capture = {}
+        img = fit_panel(obtain_image(cfg, species, bundle, capture=capture))
+        if "species" in capture:
+            scope = birdweather_signature_scope(cfg) if cfg.get("species_source") == "birdweather" else ""
+            sig = signature(capture["species"], scope)
+            if bundle is not None:
+                sig = hashlib.sha256(
+                    (sig + ":" + bundle.reference.get("selection_revision", bundle.reference["revision"])).encode()
+                ).hexdigest()[:16]
     except Exception as e:
         print(f"could not get image: {e}", file=sys.stderr)  # keep last panel image
-        return
+        return False
     img = mat_and_center(img, cfg["mat"], cfg["opening"])
     if preview:
         out = quantize_spectra6(img)
@@ -375,14 +472,15 @@ def run(cfg, preview=None, force=False, use_signature=True, mat_box=False):
             _draw_mat_box(out, cfg["opening"])
         out.save(preview)
         print(f"wrote preview {preview}")
-        return
+        return True
     try:
         push_panel(img, cfg["rotate"], cfg["saturation"], cfg.get("panel", ""))
     except Exception as e:
         print(f"panel push failed: {e}", file=sys.stderr)
-        return
+        return False
     save_state(cfg["state"], sig if sig is not None else state.get("signature"), now)
     print("panel updated")
+    return True
 
 
 def load_config(path):
@@ -404,6 +502,7 @@ def main():
     ap.add_argument("--force", action="store_true", help="refresh even if unchanged")
     ap.add_argument("--no-signature", action="store_true", help="skip change detection")
     ap.add_argument("--mat-box", action="store_true", help="dev: outline the mat window on the preview")
+    ap.add_argument("--wait-lock", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -422,12 +521,20 @@ def main():
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     lock = open(lock_path, "w")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        flags = fcntl.LOCK_EX if args.wait_lock else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(lock, flags)
     except OSError:
         print("another render is in progress; skipping")
-        return
-    run(cfg, preview=args.preview, force=args.force, use_signature=not args.no_signature, mat_box=args.mat_box)
+        return 0
+    succeeded = run(
+        cfg,
+        preview=args.preview,
+        force=args.force,
+        use_signature=not args.no_signature,
+        mat_box=args.mat_box,
+    )
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

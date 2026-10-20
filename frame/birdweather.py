@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Top recently-heard birds near a ZIP, from BirdWeather, for the frame's
---bird-weather mode.
+"""Top recently-heard birds near a ZIP or one BirdWeather station for the
+frame's --bird-weather mode.
 
 Returns the shape the collage already expects, [{"sci","com","n"}], so the
 existing renderer draws it unchanged. Standalone (Python stdlib only). Filtered
@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import stat
 import urllib.parse
 import urllib.request
 
@@ -26,17 +27,82 @@ _drawable = None
 _GEO_CACHE = os.path.expanduser("~/.birdframe/geocode.json")
 
 
-def _graphql(query, timeout):
+class BirdWeatherError(RuntimeError):
+    """A public BirdWeather lookup failed or returned an unsafe shape."""
+
+
+def _graphql(query, timeout, variables=None, strict=False):
+    body = {"query": query}
+    if variables is not None:
+        body["variables"] = variables
     req = urllib.request.Request(
         BIRDWEATHER,
-        data=json.dumps({"query": query}).encode(),
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "User-Agent": "AvianVisitors-frame/1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read(2_000_000))
-    except Exception:
+            raw = r.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise BirdWeatherError("BirdWeather response is too large")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise BirdWeatherError("BirdWeather returned an invalid response")
+        if strict and not isinstance(payload.get("data"), dict):
+            raise BirdWeatherError("BirdWeather response has no data")
+        return payload
+    except Exception as exc:
+        if strict:
+            if isinstance(exc, BirdWeatherError):
+                raise
+            raise BirdWeatherError("BirdWeather lookup failed") from exc
         return {}  # a transient upstream failure degrades to the next radius or fallback
+
+
+def station_id(value):
+    """Return a canonical public numeric station ID, or raise ValueError.
+
+    BirdWeather station IDs are public identifiers, not station upload tokens.
+    Keep this aligned with the website's 32-bit station-ID boundary.
+    """
+    if isinstance(value, bool):
+        raise ValueError("station ID must be a number from 1 through 2147483647")
+    text = str(value)
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", text):
+        raise ValueError("station ID must be a number from 1 through 2147483647")
+    number = int(text)
+    if number > 2147483647:
+        raise ValueError("station ID must be a number from 1 through 2147483647")
+    return str(number)
+
+
+def _bounded_int(value, name, low, high):
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ValueError(f"{name} must be from {low} through {high}")
+    return value
+
+
+def station_location(value, timeout=20):
+    """Coordinates for the exact public station selected by this frame."""
+    sid = station_id(value)
+    payload = _graphql(
+        "query FrameStationLocation($stationId: ID!) { station(id: $stationId) { id coords { lat lon } } }",
+        timeout,
+        variables={"stationId": sid},
+        strict=True,
+    )
+    station = payload["data"].get("station")
+    try:
+        if not isinstance(station, dict) or station_id(station.get("id")) != sid:
+            raise ValueError("station identity mismatch")
+        coords = station["coords"]
+        latitude, longitude = coords["lat"], coords["lon"]
+        if any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+               for item in (latitude, longitude)) or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("station coordinates invalid")
+        return float(latitude), float(longitude)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BirdWeatherError("BirdWeather did not return this station's location") from error
 
 
 def geocode(zip_code, country="us", timeout=20):
@@ -99,6 +165,64 @@ def top_species(lat, lon, miles, days=7, limit=60, timeout=20):
     return out
 
 
+def top_species_for_station(value, days=7, limit=60, timeout=20):
+    """BirdWeather's species for exactly one public station.
+
+    This path is intentionally strict and has no geographic or eBird fallback.
+    A station-tethered frame must never substitute another station's birds.
+    """
+    sid = station_id(value)
+    days = _bounded_int(days, "days", 1, 365)
+    limit = _bounded_int(limit, "limit", 1, 200)
+    query = """
+query FrameStation($stationId: ID!, $stationIds: [ID!]!, $period: InputDuration!, $limit: Int!) {
+  station(id: $stationId) { id }
+  topSpecies(stationIds: $stationIds, period: $period, limit: $limit) {
+    count
+    species { commonName scientificName }
+  }
+}
+""".strip()
+    payload = _graphql(query, timeout, variables={
+        "stationId": sid,
+        "stationIds": [sid],
+        "period": {"count": days, "unit": "day"},
+        "limit": limit,
+    }, strict=True)
+    data = payload["data"]
+    station = data.get("station")
+    if not isinstance(station, dict):
+        raise BirdWeatherError(f"BirdWeather station {sid} was not found")
+    try:
+        returned_id = station_id(station.get("id"))
+    except ValueError as exc:
+        raise BirdWeatherError("BirdWeather returned an invalid station") from exc
+    if returned_id != sid:
+        raise BirdWeatherError("BirdWeather returned a different station")
+    rows = data.get("topSpecies")
+    if not isinstance(rows, list):
+        raise BirdWeatherError("BirdWeather returned an invalid species list")
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise BirdWeatherError("BirdWeather returned an invalid species row")
+        sp = row.get("species")
+        count = row.get("count")
+        if (not isinstance(sp, dict) or isinstance(count, bool)
+                or not isinstance(count, int) or count < 1):
+            raise BirdWeatherError("BirdWeather returned an invalid species row")
+        sci = sp.get("scientificName")
+        com = sp.get("commonName")
+        if not isinstance(sci, str) or not sci.strip():
+            raise BirdWeatherError("BirdWeather returned an invalid species row")
+        if not isinstance(com, str) or not com.strip():
+            com = sci
+        out.append({"sci": sci, "com": com, "n": count})
+    out.sort(key=lambda s: -s["n"])
+    return out
+
+
 def _haversine(lat1, lon1, lat2, lon2):
     """Great-circle distance between two points, in miles."""
     r = 3958.8
@@ -149,11 +273,44 @@ def triangulate(lat, lon, n=3, days=7, timeout=20):
     return out
 
 
+def _private_ebird_key():
+    """Read the setup account's key after the bundle launcher resets its environment."""
+    directory = os.path.expanduser("~/.birdframe")
+    parent = descriptor = None
+    try:
+        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptor = os.open(
+            "ebird-api-key", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent,
+        )
+        info = os.fstat(parent)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise BirdWeatherError("the private eBird credential directory is unsafe")
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or not 1 <= info.st_size <= 4096):
+            raise BirdWeatherError("the private eBird credential is unsafe")
+        raw = os.read(descriptor, 4097)
+        if len(raw) != info.st_size or re.fullmatch(rb"[A-Za-z0-9]{1,4095}\n?", raw) is None:
+            raise BirdWeatherError("the private eBird credential is invalid")
+        return raw.removesuffix(b"\n").decode("ascii")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise BirdWeatherError("the private eBird credential is unavailable or unsafe") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
+
+
 def ebird_nearby(lat, lon, days=14, key=None, timeout=20):
     """Recent eBird observations near the point, as [{sci,com,n}]. The deepest
     fallback, for spots with no station in range. Needs a free eBird API key in
-    EBIRD_API_KEY and returns [] without one, so keyless installs just skip it."""
-    key = key or os.environ.get("EBIRD_API_KEY")
+    EBIRD_API_KEY or the setup account's private key file. Keyless installs skip it."""
+    key = key or os.environ.get("EBIRD_API_KEY") or _private_ebird_key()
     if not key:
         return []
     url = f"{EBIRD}?lat={lat:.4f}&lng={lon:.4f}&dist=50&back={min(days, 30)}"
@@ -180,26 +337,40 @@ def slugify(sci):
 
 
 def drawable_slugs(apt_js=APT_JS):
-    """Base slugs we have a cutout for, parsed once from the collage's bundled
-    DIMS table (perched and flight entries collapse to the base slug)."""
+    """Base slugs we have a cutout for (perched and flight entries collapse
+    to the base slug). The refreshed frontend keeps the table in dims.json
+    beside apt.js; older bundles inline it as `var DIMS = {...}` in apt.js,
+    so that parse stays as the fallback."""
     global _drawable
     if _drawable is None:
-        with open(apt_js, encoding="utf-8") as f:
-            block = re.search(r"var DIMS = (\{.*?\});", f.read(), re.S)
-        keys = re.findall(r'"([a-z0-9-]+)"\s*:', block.group(1)) if block else []
+        keys = []
+        dims_json = os.path.join(os.path.dirname(apt_js), "dims.json")
+        try:
+            with open(dims_json, encoding="utf-8") as f:
+                keys = list(json.load(f).keys())
+        except (OSError, ValueError):
+            pass
+        if not keys:
+            with open(apt_js, encoding="utf-8") as f:
+                block = re.search(r"var DIMS = (\{.*?\});", f.read(), re.S)
+            keys = re.findall(r'"([a-z0-9-]+)"\s*:', block.group(1)) if block else []
+        if not keys:
+            raise RuntimeError(
+                "no drawable species table: neither dims.json nor an inline "
+                "DIMS block; refusing to filter every bird into an empty nest")
         _drawable = {re.sub(r"-2$", "", k) for k in keys}
     return _drawable
 
 
 def species_for_zip(zip_code, country="us", target=10, days=7, radii=(15, 30, 50),
-                    apt_js=APT_JS, timeout=20):
+                    apt_js=APT_JS, timeout=20, drawable=None):
     """Geocode the ZIP, pull BirdWeather top species, and grow the search radius
     only until `target` drawable species are found, so it stays as local as the
     data allows. Returns the top `target` by detection count, or fewer where
     birds or stations are sparse.
     """
     lat, lon = geocode(zip_code, country, timeout)
-    have = drawable_slugs(apt_js)
+    have = drawable_slugs(apt_js) if drawable is None else frozenset(drawable)
     found = []
     for miles in radii:
         found = [s for s in top_species(lat, lon, miles, days, 60, timeout)
@@ -217,6 +388,16 @@ def species_for_zip(zip_code, country="us", target=10, days=7, radii=(15, 30, 50
         if len(eb) > len(found):
             found = eb
     found.sort(key=lambda s: -(s["n"] or 0))
+    return found[:target]
+
+
+def species_for_station(value, target=10, days=7, apt_js=APT_JS, timeout=20,
+                        drawable=None):
+    """Top drawable birds heard by exactly one public BirdWeather station."""
+    target = _bounded_int(target, "target", 1, 60)
+    drawable = drawable_slugs(apt_js) if drawable is None else frozenset(drawable)
+    found = [s for s in top_species_for_station(value, days, max(60, target), timeout)
+             if slugify(s["sci"]) in drawable]
     return found[:target]
 
 
@@ -255,23 +436,51 @@ def coverage_for_zip(zip_code, country="us", sample=15, days=7, radii=(15, 30, 5
     return have, missing
 
 
+def coverage_for_station(value, sample=15, days=7, apt_js=APT_JS, timeout=20):
+    """Split one station's top species by whether the frame can draw them."""
+    sample = _bounded_int(sample, "sample", 1, 60)
+    top = top_species_for_station(value, days, sample, timeout)
+    drawable = drawable_slugs(apt_js)
+    have = [s for s in top if slugify(s["sci"]) in drawable]
+    missing = [s for s in top if slugify(s["sci"]) not in drawable]
+    return have, missing
+
+
 if __name__ == "__main__":
     import argparse
     import sys
-    ap = argparse.ArgumentParser(description="BirdWeather top species for a ZIP.")
-    ap.add_argument("zip")
+    ap = argparse.ArgumentParser(description="BirdWeather top species for a ZIP or station.")
+    ap.add_argument("zip", nargs="?")
+    ap.add_argument("--station-id", help="Public numeric ID at the end of a BirdWeather station URL.")
     ap.add_argument("--country", default="us")
     ap.add_argument("--target", type=int, default=10)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--missing", action="store_true",
-                    help="Print the ZIP's top LOCAL birds the repo can't draw yet "
+                    help="Print the source's top birds the repo can't draw yet "
                          "as Sci|Com lines (feed to pregen.py --stdin); summary to stderr.")
     ap.add_argument("--sample", type=int, default=15,
-                    help="How many of the ZIP's top birds to weigh for --missing (default 15).")
+                    help="How many of the source's top birds to weigh for --missing (default 15).")
+    ap.add_argument("--check-station", action="store_true",
+                    help="Validate one --station-id without requiring any detections.")
     a = ap.parse_args()
+    if bool(a.zip) == bool(a.station_id):
+        ap.error("provide exactly one ZIP or --station-id")
+    if a.check_station:
+        if not a.station_id or a.missing:
+            ap.error("--check-station requires --station-id and cannot be combined with --missing")
+        try:
+            top_species_for_station(a.station_id, a.days, 1)
+        except (ValueError, BirdWeatherError) as e:
+            print(f"station lookup failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"BirdWeather station {station_id(a.station_id)} is available")
+        sys.exit(0)
     if a.missing:
         try:
-            have, missing = coverage_for_zip(a.zip, a.country, a.sample, a.days)
+            if a.station_id:
+                have, missing = coverage_for_station(a.station_id, a.sample, a.days)
+            else:
+                have, missing = coverage_for_zip(a.zip, a.country, a.sample, a.days)
         except Exception as e:
             # Never break the installer: no data just means no generation offer.
             print(f"coverage lookup failed: {e}", file=sys.stderr)
@@ -279,8 +488,13 @@ if __name__ == "__main__":
         for s in missing:
             print(f'{s["sci"]}|{s["com"]}')
         total = len(have) + len(missing)
-        print(f"{len(have)} of the top {total} birds near {a.zip} are bundled; "
+        where = f"station {station_id(a.station_id)}" if a.station_id else f"{a.zip}"
+        print(f"{len(have)} of the top {total} birds for {where} are bundled; "
               f"{len(missing)} are not.", file=sys.stderr)
     else:
-        for s in species_for_zip(a.zip, a.country, a.target, a.days):
+        if a.station_id:
+            species = species_for_station(a.station_id, a.target, a.days)
+        else:
+            species = species_for_zip(a.zip, a.country, a.target, a.days)
+        for s in species:
             print(f'{s["n"]:>8}  {s["com"]}  ({s["sci"]})')

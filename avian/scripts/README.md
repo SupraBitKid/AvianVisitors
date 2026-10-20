@@ -22,9 +22,21 @@ python3 pregen.py --labels ~/BirdNET-Pi/model/labels.txt --ebird-region US-CA
 # 2. cut the ground off and crop
 python3 cutout.py
 
-# 3. rebuild the collage masks, then bump SKETCH_VERSION + IMG_VERSION in apt.js
+# 3. rebuild the collage masks
 python3 build_masks.py
 ```
+
+When this is the checkout used by a running station, always finish with
+`build_masks.py`. `pregen.py` and `cutout.py` invalidate the live artwork cache
+before each durable replacement, and the final mask build is what republishes
+the complete PNG/geometry snapshot. Never `scp` or copy individual PNGs over
+the station's live illustration directory.
+
+If `dims.json` or `masks.json` changed, always bump `TABLE_VERSION` in
+`apt.js`. For a one-species correction, also add or update that species in
+`ART_REVISIONS`. For a regional or library-wide rebuild, bump
+`SKETCH_VERSION` and `IMG_VERSION` instead of creating hundreds of species
+revisions.
 
 `--labels` takes any `Sci|Com` per-line file (BirdNET-Pi's `labels.txt` works
 directly). `--ebird-region` filters to species actually seen in your region
