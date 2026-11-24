@@ -613,7 +613,9 @@ assert.match(css, /#atlasGrid\[data-layout="classic"\][\s\S]*?repeat\(auto-fill,
   'Classic mode restores the historical responsive desktop grid');
 assert.match(css, /#atlasGrid\[data-layout="classic"\][\s\S]*?repeat\(2, minmax\(0, 1fr\)\)/,
   'Classic mode restores the historical two-up mobile grid');
-assert.match(html, /styles\.css\?v=r196/, 'Classic Atlas styles have a fresh cache key');
-assert.match(html, /apt\.js\?v=r241/, 'Classic Atlas and admin recovery behavior have a fresh cache key');
+assert.ok(Number((html.match(/styles\.css\?v=r(\d+)/) || [])[1]) >= 197,
+  'station styles include the current postcard controls');
+assert.ok(Number((html.match(/apt\.js\?v=r(\d+)/) || [])[1]) >= 242,
+  'the frontend cache key must include the current settings changes');
 
 console.log('classic Atlas smoke: ok');

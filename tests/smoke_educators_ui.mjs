@@ -4111,7 +4111,9 @@ assert.equal(countCells.view.label, 'View Period 3. 4 birds. 9 calls.',
 assert.equal(pendingCountRemoved, 1, 'the patched row leaves the pending observation set');
 assert.match(functionSource('suspendEducatorScopes'), /clearEducatorCountState/,
   'admin authorization loss clears private saved-count state');
-assert.match(html, /styles\.css\?v=r196/, 'the Educators workspace styles use the frozen cache key');
-assert.match(html, /apt\.js\?v=r241/, 'the Educators workspace behavior uses the frozen cache key');
+assert.ok(Number((html.match(/styles\.css\?v=r(\d+)/) || [])[1]) >= 197,
+  'station styles include the current postcard controls');
+assert.ok(Number((html.match(/apt\.js\?v=r(\d+)/) || [])[1]) >= 242,
+  'the frontend cache key must include the current settings changes');
 
 console.log('Educators frontend smoke: ok');

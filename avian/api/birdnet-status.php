@@ -41,7 +41,7 @@ $action = $_GET['action'] ?? 'diag';
 $BIRDNETPI_DIR = dirname(__DIR__, 2);
 $BIRDSONGS_DIR = dirname(__DIR__, 3) . '/BirdSongs';
 $DB_PATH       = "$BIRDNETPI_DIR/scripts/birds.db";
-$CONF_PATH     = "$BIRDNETPI_DIR/birdnet.conf";
+$CONF_PATH     = '/etc/birdnet/birdnet.conf';
 $STREAM_DIR    = "$BIRDSONGS_DIR/StreamData";
 $ADMIN_CONTROL = getenv('AV_ADMIN_CONTROL') ?: '/usr/local/sbin/avian-admin-control';
 
@@ -291,6 +291,19 @@ function logs_for(string $control, string $unit, int $lines): array {
 }
 
 switch ($action) {
+
+    case 'version': {
+        $rc = 0;
+        $raw = admin_control_output($ADMIN_CONTROL, ['release'], $rc);
+        $result = json_decode($raw, true);
+        if ($rc !== 0 || !is_array($result) || empty($result['ok']) || !is_string($result['release'] ?? null)) {
+            http_response_code(503);
+            echo json_encode(['ok' => false, 'error' => 'station version is unavailable']);
+        } else {
+            echo json_encode(['ok' => true, 'release' => $result['release']]);
+        }
+        break;
+    }
 
     case 'system': {
         echo json_encode([

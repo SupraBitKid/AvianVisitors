@@ -70,6 +70,17 @@ sudo /usr/local/sbin/avian-admin-control password-reset
 
 The command prompts privately for a new password. Return to **Settings** after it finishes.
 
+### Correcting a detection
+
+Open a bird's postcard, expand a clip under **Recordings**, and choose
+**Mark incorrect**. This requires station admin access and removes only that
+detection from the database and counts. Audio and spectrogram files stay on disk.
+Shared listening-period links are read-only.
+
+If another detection arrives while you review a clip, the list may refresh
+before you can confirm. Custom WAL databases need Educators insertion tracking
+for this control; otherwise it stays hidden.
+
 ### Educators mode
 
 Educators mode is an optional profile for the BirdNET-Pi website. It adds a fifth menu page for starting, pausing, organizing, and reviewing listening periods. Enable it after installation over SSH:
@@ -145,7 +156,7 @@ PNG temporarily marks the included artwork unavailable; the final
 `build_masks.py` call atomically republishes matching geometry and restores it.
 Do not copy individual PNGs directly into the live illustration directory.
 
-On a Pi with 4 GB of RAM or less, add `--model u2net` to the `cutout.py` command; the default model may be [OOM-killed](https://github.com/Twarner491/AvianVisitors/issues/17).
+If `cutout.py` runs out of memory, retry with `--model u2net`. The default model has been [OOM-killed even on an 8 GB Pi 5](https://github.com/Twarner491/AvianVisitors/pull/89); on a Pi with 4 GB or less, start with `--model u2net`.
 
 Filter to your region with `--ebird-region US-CA` (needs `EBIRD_API_KEY`). The full pipeline, prompt, reference images, and per-species tuning live in [`avian/scripts/README.md`](avian/scripts/README.md). Style lives in [`prompt.template.md`](avian/scripts/prompt.template.md).
 
