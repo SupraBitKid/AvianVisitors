@@ -1,0 +1,15 @@
+#!/bin/sh
+# Human-facing bundle switcher. The installed copy is root-owned; all parsing,
+# trust refresh, download, verification, and atomic activation stay in the
+# separately installed manager.
+set -eu
+
+PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$#" -lt 2 ] || [ "$#" -gt 18 ] || [ "$1" != "use" ]; then
+  printf '%s\n' "Usage: avian-bundle use <bundle-id> [<bundle-id>...] [--all-species]" >&2
+  exit 64
+fi
+
+exec /usr/local/sbin/avian-bundle-control "$@"

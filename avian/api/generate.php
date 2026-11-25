@@ -14,16 +14,18 @@
 //                          both cost control and input control, since
 //                          sci/com reach a shell command line.
 //
-// Uses the Gemini key saved via the settings panel (GEMINI_API_KEY in
-// birdnet.conf). Direct private-address requests are available without a
-// password unless the owner enables the LAN admin gate. Forwarded and
-// public-host requests always require the station password.
+// Uses the Gemini key saved via the settings panel and an optional image
+// model override in the station config. Direct private-address requests are
+// available without a password unless the owner enables the LAN admin gate.
+// Forwarded and public-host requests always require the station password.
 
 declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 
 require_once __DIR__ . '/admin-auth.php';
+require_once __DIR__ . '/bundle-runtime.php';
+require_once __DIR__ . '/station-config.php';
 avian_require_admin();
 
 $BIRDNETPI_DIR = dirname(__DIR__, 2);
@@ -36,7 +38,7 @@ if (!is_string($LOCK) || $LOCK === '') {
 }
 $LOG     = "$ILLUS/.generate.log";
 $DB_PATH = "$BIRDNETPI_DIR/scripts/birds.db";
-$CONF    = "$BIRDNETPI_DIR/birdnet.conf";
+$CONF    = '/etc/birdnet/birdnet.conf';
 $STALE_S = 15 * 60;   // a "running" state older than this is a dead run
 $HOUR_CAP = 20;       // max starts per rolling hour (cost brake)
 
@@ -65,18 +67,14 @@ function chroma_count(string $illus): int {
     return $n;
 }
 
-function conf_value(string $conf, string $key): string {
-    if (!is_readable($conf)) return '';
-    foreach (file($conf, FILE_IGNORE_NEW_LINES) as $line) {
-        if (preg_match('/^\s*' . $key . '\s*=\s*(.*)$/', $line, $m)) {
-            $v = trim($m[1]);
-            if (strlen($v) >= 2 && $v[0] === '"' && substr($v, -1) === '"') {
-                $v = substr($v, 1, -1);
-            }
-            return $v;
+function conf_value(string $conf, string $key): ?string {
+    $value = '';
+    foreach (@file($conf, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+        if (preg_match('/^\s*(?:export\s+)?' . preg_quote($key, '/') . '\s*=\s*(.*)$/', $line, $m)) {
+            $value = avian_station_config_literal($m[1]);
         }
     }
-    return '';
+    return $value;
 }
 
 function atomic_write(string $path, string $contents): bool {
@@ -115,7 +113,12 @@ function restore_file(string $path, bool $existed, string $contents): bool {
 }
 
 function find_executable(string $name): ?string {
-    foreach (explode(PATH_SEPARATOR, (string)getenv('PATH')) as $directory) {
+    // PHP-FPM clears PATH unless the pool explicitly supplies it.
+    $path = (string)getenv('PATH');
+    $directories = $path !== ''
+        ? explode(PATH_SEPARATOR, $path)
+        : ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'];
+    foreach ($directories as $directory) {
         if ($directory === '' || $directory[0] !== DIRECTORY_SEPARATOR) continue;
         $candidate = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $name;
         if (is_file($candidate) && is_executable($candidate)) return $candidate;
@@ -149,6 +152,17 @@ if ($action === 'status') {
 
 if ($action === 'start') {
     avian_require_json_action();
+    $activeBundle = avian_bundle_active_state();
+    if ($activeBundle['status'] !== 'ok') {
+        http_response_code(503);
+        echo json_encode(['error' => 'active bundle state is unavailable']);
+        exit;
+    }
+    if (!$activeBundle['included']) {
+        http_response_code(409);
+        echo json_encode(['error' => 'switch to Japanese Woodblock before generating station artwork']);
+        exit;
+    }
     try {
         $body = json_decode((string)file_get_contents('php://input'), false, 16, JSON_THROW_ON_ERROR);
     } catch (JsonException $e) {
@@ -208,9 +222,16 @@ if ($action === 'start') {
     $com = (string)$row['Com_Name'];
 
     $key = conf_value($CONF, 'GEMINI_API_KEY');
-    if ($key === '') {
+    if ($key === null || $key === '') {
         http_response_code(409);
         echo json_encode(['error' => 'no gemini key', 'hint' => 'add it in settings']);
+        exit;
+    }
+    $imageModel = conf_value($CONF, 'GEMINI_IMAGE_MODEL');
+    if ($imageModel === null
+        || ($imageModel !== '' && !preg_match('/\Agemini-[a-z0-9]+(?:[.-][a-z0-9]+)*\z/', $imageModel))) {
+        http_response_code(409);
+        echo json_encode(['error' => 'invalid Gemini image model', 'hint' => 'check GEMINI_IMAGE_MODEL in birdnet.conf']);
         exit;
     }
 
@@ -338,6 +359,8 @@ if ($action === 'start') {
     $environment = getenv();
     if (!is_array($environment)) $environment = [];
     $environment['GEMINI_API_KEY'] = $key;
+    unset($environment['GEMINI_IMAGE_MODEL']);
+    if ($imageModel !== '') $environment['GEMINI_IMAGE_MODEL'] = $imageModel;
     $descriptors = [
         0 => ['file', '/dev/null', 'r'],
         1 => ['file', '/dev/null', 'a'],

@@ -12,7 +12,8 @@ The bundled set centers on the western U.S., so an out-of-region frame drops
 its local birds until they are generated. Run this on a machine with the
 pipeline deps (rembg + onnxruntime, per avian/scripts/requirements.txt) - a
 laptop or workstation, not the frame Pi, which can't fit rembg in memory. Then
-commit the new cutouts (or copy them to the Pi) and the frame draws them.
+commit the new cutouts or package them as a bundle. Do not copy individual PNGs
+into a running station outside its generation/install workflow.
 
 Needs a PAID Google Gemini API key: image generation is not on the free tier.
 Get one at https://ai.google.dev, then pass it by env (keeps it out of shell
@@ -24,6 +25,7 @@ history) or let it prompt:
     python3 frame/generate_illustrations.py --station-id 12345
 
 --country supports non-US postcodes; --sample controls how many top species are checked.
+GEMINI_IMAGE_MODEL overrides the image model used by pregen.py.
 """
 from __future__ import annotations
 
@@ -75,7 +77,8 @@ def _generate(missing, key):
     if b.returncode != 0:
         return b.returncode
     print(f"\nDone - {len(made)} new illustrations are cut and drawable. Commit them "
-          f"(or copy them to the frame Pi) and the collage will draw them.")
+          "or package and install them as a bundle; do not overwrite a running "
+          "station's live PNG directory directly.")
     return 0
 
 

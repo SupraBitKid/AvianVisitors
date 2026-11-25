@@ -117,6 +117,7 @@ mkdir -p \
   "$repo/avian/assets/illustrations" \
   "$repo/avian/assets/references" \
   "$repo/avian/frontend" \
+  "$repo/avian/scripts" \
   "$repo/scripts" \
   /etc/birdnet \
   /etc/sudoers.d
@@ -132,6 +133,9 @@ cp /source/homepage/views.php "$repo/views.php"
 cp /source/scripts/common.php "$repo/scripts/common.php"
 printf '{}\n' >"$repo/avian/frontend/dims.json"
 printf '{}\n' >"$repo/avian/frontend/masks.json"
+cp /source/avian/scripts/build_masks.py "$repo/avian/scripts/build_masks.py"
+cp /source/avian/assets/illustrations/corvus-brachyrhynchos.png \
+  "$repo/avian/assets/illustrations/corvus-brachyrhynchos.png"
 printf '##start\n##end\n' >"$repo/scripts/disk_check_exclude.txt"
 printf '<?php echo "RECORDINGS_VIEW_OK"; ?>\n' >"$repo/play.php"
 printf 'body {}\n' >"$repo/style.css"
@@ -165,6 +169,8 @@ for helper in \
   avian-educators; do
   install -o root -g root -m 0755 /tmp/avian-noop-control "/usr/local/sbin/$helper"
 done
+install -o root -g root -m 0755 /source/scripts/generation_runtime_control.sh \
+  /usr/local/sbin/avian-generation-runtime
 cat >/usr/local/sbin/avian-caddy-refresh <<'EOF'
 #!/bin/sh
 set -eu
@@ -220,6 +226,22 @@ cp "$state_source" /tmp/avian-caddy-loaded.state
 EOF
 chmod 0755 /usr/local/sbin/avian-caddy-refresh
 chown root:root /usr/local/sbin/avian-caddy-refresh
+
+id avian-bundle >/dev/null 2>&1 \
+  || useradd --system --user-group --home-dir /nonexistent \
+    --shell /usr/sbin/nologin avian-bundle
+install -d -o root -g root -m 0755 /var/empty /var/lib/avian-visitors
+install -d -o root -g root -m 0555 /var/empty/avian-bundle
+install -o root -g root -m 0755 /source/avian/scripts/bundle_manager.py \
+  /usr/local/sbin/avian-bundle-control
+install -o root -g root -m 0755 /source/scripts/avian-bundle \
+  /usr/local/bin/avian-bundle
+install -d -o root -g root -m 0755 /usr/share/avian-visitors/bundles
+install -o root -g root -m 0644 /source/avian/bundles/catalog-v1.json \
+  /usr/share/avian-visitors/bundles/catalog-v1.json
+/usr/local/sbin/avian-bundle-control initialize --json >/dev/null
+install -o root -g root -m 0644 /dev/null \
+  /var/lib/avian-visitors/bundles-v1.enabled
 
 /source/scripts/security_refresh.sh >/tmp/avian-security-refresh.out
 grep -Fxq 'security refresh: ok' /tmp/avian-security-refresh.out \
@@ -424,6 +446,8 @@ code=$(curl -sS -o /tmp/avian-api-body -w '%{http_code}' \
 [ "$code" = 200 ] || fail "midnight reset setting was not accepted"
 grep -Fxq 'RESET_AT_MIDNIGHT=1' "$conf" \
   || fail "midnight reset setting did not reach the root config writer"
+[ -L /etc/birdnet/birdnet.conf ] && [ "$(readlink -f /etc/birdnet/birdnet.conf)" = "$conf" ] \
+  || fail "config writer replaced the canonical symlink"
 curl -fsS -b /tmp/avian-cookie http://127.0.0.1:8896/avian/api/config.php \
   >/tmp/avian-api-body
 grep -Fq '"RESET_AT_MIDNIGHT":true' /tmp/avian-api-body \
